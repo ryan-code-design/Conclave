@@ -582,6 +582,8 @@ export class ConversationService {
     }
     if (projectPaths.length > MAX_TASK_REPOS) throw new Rejection('too-many-projects')
     const { permissionMode, model, effort, worktree = false, branch } = start
+    const readOnly = Boolean(start.readOnly || discussion || start.profile?.capability === 'readOnly' || squad?.readOnly)
+    this.checkReadOnly(agent, readOnly, Boolean(discussion))
     const worktreesRoot = worktree ? this.worktreesRoot : null
     if (worktree && (!worktreesRoot || projectPaths.length === 0)) throw new Rejection('missing-repo', 'a worktree needs a project to lay out')
     if (!start.deferStart && !this.capacityAvailable(agent)) throw new Rejection('agent-capacity')
@@ -621,11 +623,11 @@ export class ConversationService {
     const created = this.store.create(agent, workspace, projects, id, starts, null, routine, discussion)
     if (start.modelProvider) this.store.setModelProvider(id, start.modelProvider)
     if (start.profile) this.store.setProfile(id, start.profile, start.parentId ?? null, start.callId ?? null)
-    if (start.readOnly || start.profile?.capability === 'readOnly') this.store.setWorkspaceReadOnly(id, true)
+    if (readOnly) this.store.setWorkspaceReadOnly(id, true)
     if (start.referencePaths?.length) this.store.setReferencePaths(id, start.referencePaths)
     if (squad) this.store.setSquad(id, squad.runId, squad.readOnly)
     if (squad?.referencePaths?.length) this.store.setReferencePaths(id, squad.referencePaths)
-    if (allowBypass !== undefined) this.store.setChatOptions(id, { allowBypass })
+    if (allowBypass !== undefined) this.store.setChatOptions(id, { allowBypass: readOnly ? false : allowBypass })
     if (permissionMode) this.store.setChatOptions(id, { permissionMode })
     if (model || effort) this.store.setChatOptions(id, { [agent]: { model, effort } })
     // The paths as picked, not resolved: the same strings a task stores for them.
@@ -691,6 +693,7 @@ export class ConversationService {
   // A task's chat: made on the task's first start, then moved to wherever its agent works next.
   // Resolves once the agent can take a message, which the task then sends.
   async startForTask(task: { id: string; title: string; agent: AgentKind }, launch: TaskChatLaunch): Promise<Conversation> {
+    this.checkReadOnly(task.agent, Boolean(launch.workspaceReadOnly))
     const cwd = await realpath(launch.cwd)
     const extraDirs = await Promise.all(launch.extraDirs.map((dir) => realpath(dir)))
     const projectPaths = [cwd, ...extraDirs]
@@ -720,7 +723,7 @@ export class ConversationService {
     this.store.setWorkspaceReadOnly(id, launch.workspaceReadOnly ?? false)
     if (regrouped) this.store.moveWorkspace(id, cwd, projectPaths, referencePaths)
     if (conversation.title !== task.title) this.store.update(id, { title: task.title })
-    if (launch.allowBypass !== undefined) this.store.setChatOptions(id, { allowBypass: launch.allowBypass })
+    if (launch.allowBypass !== undefined) this.store.setChatOptions(id, { allowBypass: launch.workspaceReadOnly ? false : launch.allowBypass })
     // A stage of its own plans first; one going on keeps the mode it was left in, unless it is given
     // one, as a squad's leader is when it goes on from planning to leading.
     if (launch.session === 'new' || launch.permissionMode) this.store.setChatOptions(id, { permissionMode: launch.permissionMode ?? 'plan' })
@@ -811,8 +814,9 @@ export class ConversationService {
     this.writable(id)
     const current = this.free(id)
     if (this.launching.has(id)) throw new Rejection('conversation-running')
+    this.checkReadOnly(current.agent, Boolean(current.workspaceReadOnly || current.discussionId), Boolean(current.discussionId))
     if (current.sessionId && this.chats.activity(id) !== null && !this.chats.sessionLost(id)) return current
-    if (allowBypass !== undefined) this.store.setChatOptions(id, { allowBypass })
+    if (allowBypass !== undefined) this.store.setChatOptions(id, { allowBypass: current.workspaceReadOnly || Boolean(current.discussionId) ? false : allowBypass })
     if (current.sessionId) await this.stop(id)
     return this.start(id, current.agent, '', false, { readable })
   }
@@ -843,10 +847,11 @@ export class ConversationService {
     if (current.squadRunId || current.parentConversationId) throw new Rejection('squad-managed')
     if (current.discussionId) throw new Rejection('discussion-member', 'a group chat member keeps its agent')
     if (agent === current.agent) throw new Rejection('conversation-same-agent')
+    this.checkReadOnly(agent, Boolean(current.workspaceReadOnly))
     const decision = this.routeFor(current, agent)
     if (decision.kind === 'unavailable') throw new Rejection('model-provider-unavailable', decision.message)
     await this.validateStartOptions(agent, choice, decision.kind === 'provider' ? decision.route.providerId : undefined)
-    if (allowBypass !== undefined) this.store.setChatOptions(id, { allowBypass })
+    if (allowBypass !== undefined) this.store.setChatOptions(id, { allowBypass: current.workspaceReadOnly ? false : allowBypass })
     if (this.launching.has(id)) throw new Rejection('conversation-running')
     if (current.sessionId && !stopRunning && !this.chats.idle(id)) throw new Rejection('conversation-running')
     if (!this.capacityAvailable(agent, id)) throw new Rejection('agent-capacity')
@@ -1001,7 +1006,15 @@ export class ConversationService {
     return this.changed(this.get(id))
   }
 
+  private checkReadOnly(agent: AgentKind, required: boolean, discussion = false): void {
+    if (required && agentDescriptor(agent).capabilities.readOnly === false) {
+      throw new Rejection(discussion ? 'discussion-member-read-only' : 'read-only-unsupported', `${agentDescriptor(agent).label} 不支持只读模式`)
+    }
+  }
+
   private async start(id: string, agent: AgentKind, note: string, handoff: boolean, launch: StageLaunch = {}): Promise<Conversation> {
+    const conversation = this.get(id)
+    this.checkReadOnly(agent, Boolean(conversation.workspaceReadOnly || conversation.discussionId), Boolean(conversation.discussionId))
     this.squadGuard?.(this.get(id))
     if (this.launching.has(id) || this.retiring.has(id)) throw new Rejection('conversation-running')
     if (!this.capacityAvailable(agent)) throw new Rejection('agent-capacity', 'Agent 运行数量已达到上限，请等待其他会话结束，或预约稍后执行')
