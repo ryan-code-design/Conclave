@@ -2,8 +2,8 @@ import { randomUUID } from 'node:crypto'
 import { mkdirSync, mkdtempSync, realpathSync, rmSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { DEFAULT_DISCUSSION_REQUIREMENTS, type Discussion, type DiscussionCreate, type DiscussionPost } from '@conclave/protocol'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { agentDescriptor, DEFAULT_DISCUSSION_REQUIREMENTS, type Discussion, type DiscussionCreate, type DiscussionPost } from '@conclave/protocol'
 import { DatabaseSync } from 'node:sqlite'
 import { AttachmentStore } from './attachment-store'
 import { ConversationService } from './conversation-service'
@@ -426,59 +426,116 @@ describe('DiscussionService', () => {
     expect(conversations.listAll()).toEqual([])
   })
 
-  it('migrates legacy member conversation options to match discussionMode', async () => {
-    const discussion = await discussions.create(fields({
+  it('refuses to create discussion with members lacking read-only capability', async () => {
+    await expect(discussions.create(fields({
       members: [{ agent: 'antigravity', name: 'Ann' }, { agent: 'claude', name: 'Bob' }],
       chair: 1
-    }))
+    }))).rejects.toThrowError(expect.objectContaining({ reason: 'discussion-member-read-only' }))
+
+    await expect(discussions.create(fields({
+      members: [{ agent: 'gemini', name: 'Gem' }, { agent: 'claude', name: 'Bob' }],
+      chair: 1
+    }))).rejects.toThrowError(expect.objectContaining({ reason: 'discussion-member-read-only' }))
+  })
+
+  it('refuses to add member lacking read-only capability midway', async () => {
+    const discussion = await discussions.create(fields())
+    await until(() => state(discussion.id) === 'done')
+    await expect(discussions.addMember(discussion.id, {
+      agent: 'antigravity',
+      name: 'Dan',
+      role: 'analyst'
+    })).rejects.toThrowError(expect.objectContaining({ reason: 'discussion-member-read-only' }))
+  })
+
+  it('enforces workspaceReadOnly and forbids allowBypass on member conversations', async () => {
+    const discussion = await discussions.create(fields())
+    await until(() => state(discussion.id) === 'done')
+    for (const member of discussion.members) {
+      const conv = conversations.get(member.conversationId)
+      expect(conv.workspaceReadOnly).toBe(true)
+      expect(store.chatOptions(member.conversationId).allowBypass).toBeFalsy()
+    }
+  })
+
+  it('migrates legacy member conversation options to strip allowBypass and enforce workspaceReadOnly', async () => {
+    const discussion = await discussions.create(fields())
+    await until(() => state(discussion.id) === 'done')
     const ann = by(discussion, 'Ann')
-    // Manually set legacy chat options
-    store.setChatOptions(ann.conversationId, { permissionMode: 'ask', allowBypass: false })
-    expect(store.chatOptions(ann.conversationId)).toMatchObject({ permissionMode: 'ask', allowBypass: false })
+    store.setChatOptions(ann.conversationId, { permissionMode: 'ask', allowBypass: true })
+    store.setWorkspaceReadOnly(ann.conversationId, false)
 
     // Reopen discussion service (which triggers migrateMemberOptions)
     discussions.close()
     discussions = new DiscussionService(path.join(root, 'conclave.db'), { conversations, events: { changed: () => {}, deleted: () => {}, posts: () => {} } })
 
-    expect(store.chatOptions(ann.conversationId)).toMatchObject({ permissionMode: 'bypass', allowBypass: true })
+    const options = store.chatOptions(ann.conversationId)
+    expect(options.permissionMode).toBe('plan')
+    expect(options.allowBypass).toBeUndefined()
+    expect(conversations.get(ann.conversationId).workspaceReadOnly).toBe(true)
   })
 
-  it('auto-approves tool requests for members whose discussionMode is bypass', async () => {
-    let responded: { id: string; requestId: string; answer: unknown } | null = null
-    const originalRespond = conversations.respond.bind(conversations)
-    conversations.respond = async (id, requestId, answer) => {
-      responded = { id, requestId, answer }
-      return originalRespond(id, requestId, answer).catch(() => {})
-    }
+  it.each([
+    { tool: 'Write', input: { file_path: '/tmp/example', content: 'changed' } },
+    { tool: 'Bash', input: { command: 'echo changed > /tmp/example' } },
+    { tool: 'Bash', input: { command: "python -c 'from pathlib import Path; Path(\"/tmp/example\").write_text(\"changed\")'" } },
+    { tool: 'unknown_tool', input: {} },
+    { tool: 'Read', input: { file_path: '/tmp/example' } }
+  ])('does not auto-approve $tool even when the descriptor requests bypass', async ({ tool, input }) => {
     const discussion = await discussions.create(fields())
     await until(() => state(discussion.id) === 'done')
-
-    const memberId = randomUUID()
-    const conversationId = randomUUID()
-    ;(discussions as any).db.prepare(`INSERT INTO discussion_members (id, discussion_id, position, conversation_id, agent, model, effort, name, role) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(memberId, discussion.id, 99, conversationId, 'antigravity', null, null, 'Dan', 'analyst')
-    const post = (discussions as any).insertPost(discussion.id, { round: 1, memberId, kind: 'opening', text: '', mentions: [], state: 'pending' })
-
-    const fakeConv = {
-      id: conversationId,
-      discussionId: discussion.id,
-      agent: 'antigravity',
-      chat: {
-        request: {
-          requestId: 'number:42',
-          kind: 'approval' as const,
-          tool: 'commandExecution',
-          title: 'echo hi',
-          decisions: ['allow' as const, 'deny' as const],
-          open: 1
-        }
-      }
+    const ann = by(discussion, 'Ann')
+    const session = conversations.get(ann.conversationId).sessionId!
+    const reply = daemon.reply
+    daemon.reply = (sessionId, prompt) => {
+      if (sessionId !== session) return reply(sessionId, prompt)
+      daemon.emit(sessionId, { type: 'control_request', request_id: 'req-tool', request: {
+        subtype: 'can_use_tool', tool_name: tool, input, tool_use_id: 'tool-1'
+      } })
     }
-    discussions.conversationChanged(fakeConv as any)
-    expect(responded).toMatchObject({
-      id: conversationId,
-      requestId: 'number:42',
-      answer: { decision: 'allow' }
-    })
-    ;(discussions as any).settle(post.id, conversationId, null)
+    // Reintroduce the old descriptor condition without weakening the native read-only launch.
+    const descriptor = agentDescriptor(ann.agent)
+    const original = descriptor.discussionMode
+    const respond = vi.spyOn(conversations, 'respond')
+    descriptor.discussionMode = 'bypass'
+    try {
+      await discussions.control(discussion.id, 'nextRound')
+      await until(() => conversations.get(ann.conversationId).chat?.request?.requestId === 'req-tool')
+      await settle()
+      expect(respond).not.toHaveBeenCalled()
+      expect(discussions.get(discussion.id).members.find((member) => member.id === ann.id)?.status).toBe('awaiting')
+      await conversations.respond(ann.conversationId, 'req-tool', { decision: 'deny' })
+      reply(session, 'Ann answers in words.')
+      await until(() => state(discussion.id) === 'done')
+    } finally {
+      descriptor.discussionMode = original
+      respond.mockRestore()
+    }
+  })
+
+  it.each(['antigravity', 'gemini'] as const)('refuses legacy %s members after reopening', async (agent) => {
+    const discussion = await discussions.create(fields())
+    await until(() => state(discussion.id) === 'done')
+    const ann = by(discussion, 'Ann')
+    for (const member of discussion.members) await conversations.stop(member.conversationId)
+    const db = new DatabaseSync(path.join(root, 'conclave.db'))
+    try {
+      db.prepare('UPDATE discussion_members SET agent = ? WHERE id = ?').run(agent, ann.id)
+      db.prepare('UPDATE conversations SET agent = ?, workspace_read_only = 0, chat_options = ? WHERE id = ?')
+        .run(agent, JSON.stringify({ permissionMode: 'bypass', allowBypass: true }), ann.conversationId)
+    } finally { db.close() }
+    discussions.close()
+    serve()
+    const spawns = daemon.spawns.length
+    await discussions.reconcile()
+    await discussions.control(discussion.id, 'nextRound')
+    await until(() => state(discussion.id) === 'done')
+    const posts = discussions.posts(discussion.id).filter((post) => post.memberId === ann.id && post.round === 3)
+    expect(posts).toHaveLength(1)
+    expect(posts[0]).toMatchObject({ state: 'failed', error: expect.stringContaining('discussion-member-read-only') })
+    expect(daemon.spawns.slice(spawns).every((spawn) => spawn.agent !== agent)).toBe(true)
+    expect(conversations.get(ann.conversationId).workspaceReadOnly).toBe(true)
+    expect(store.chatOptions(ann.conversationId).allowBypass).toBeUndefined()
+    await expect(conversations.continue(ann.conversationId, true)).rejects.toMatchObject({ reason: 'discussion-member-read-only' })
   })
 })

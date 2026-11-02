@@ -28,7 +28,7 @@ export const antigravity: AgentDescriptor = {
   },
   startModes: ['ask', 'acceptEdits', 'bypass'],
   defaultStartMode: 'ask',
-  discussionMode: 'bypass',
+  discussionMode: 'ask',
   readOnlyMode: 'ask',
   // Signed in with a personal account, its file tools refuse anything outside its cwd.
   primaryOnlyFiles: true,

@@ -94,15 +94,16 @@ export class DiscussionService {
 
   private migrateMemberOptions(): void {
     try {
-      const members = this.db.prepare('SELECT dm.conversation_id, dm.agent, c.chat_options FROM discussion_members dm JOIN conversations c ON dm.conversation_id = c.id').all() as { conversation_id: string; agent: AgentKind; chat_options: string | null }[]
+      const members = this.db.prepare('SELECT dm.conversation_id, dm.agent, c.chat_options, c.workspace_read_only FROM discussion_members dm JOIN conversations c ON dm.conversation_id = c.id').all() as { conversation_id: string; agent: AgentKind; chat_options: string | null; workspace_read_only: number }[]
       for (const member of members) {
         const mode = agentDescriptor(member.agent).discussionMode
-        const bypass = mode === 'bypass'
         let options: Record<string, unknown> = {}
         try { options = member.chat_options ? JSON.parse(member.chat_options) : {} } catch {}
-        if (options.permissionMode !== mode || (bypass && !options.allowBypass)) {
-          this.db.prepare('UPDATE conversations SET chat_options = ? WHERE id = ?')
-            .run(JSON.stringify({ ...options, permissionMode: mode, ...(bypass ? { allowBypass: true } : {}) }), member.conversation_id)
+        const { allowBypass: _bypass, ...rest } = options
+        const cleaned = { ...rest, permissionMode: mode }
+        if (options.permissionMode !== mode || options.allowBypass || !member.workspace_read_only) {
+          this.db.prepare('UPDATE conversations SET chat_options = ?, workspace_read_only = 1 WHERE id = ?')
+            .run(JSON.stringify(cleaned), member.conversation_id)
         }
       }
     } catch {}
@@ -128,6 +129,9 @@ export class DiscussionService {
   async create(fields: DiscussionCreate): Promise<Discussion> {
     const parsed = DiscussionCreate.parse(fields)
     for (const member of parsed.members) {
+      if (agentDescriptor(member.agent).capabilities.readOnly === false) {
+        throw new Rejection('discussion-member-read-only', `${agentDescriptor(member.agent).label} 不支持只读模式，无法加入讨论`)
+      }
       await this.deps.conversations.validateStartOptions(member.agent, { permissionMode: agentDescriptor(member.agent).discussionMode, model: member.model, effort: member.effort })
     }
     for (const agent of new Set(parsed.members.map((member) => member.agent))) {
@@ -148,8 +152,8 @@ export class DiscussionService {
     try {
       for (const member of members) {
         const mode = agentDescriptor(member.agent).discussionMode
-        await this.deps.conversations.create(member.agent, parsed.projectPaths, mode === 'bypass',
-          { permissionMode: mode, model: member.model, effort: member.effort, deferStart: true },
+        await this.deps.conversations.create(member.agent, parsed.projectPaths, false,
+          { permissionMode: mode, model: member.model, effort: member.effort, deferStart: true, readOnly: true },
           null, member.conversationId, { id, title: `${title} · ${member.name}` })
         created.push(member.conversationId)
       }
@@ -268,6 +272,9 @@ export class DiscussionService {
       if (discussion.members.some((each) => each.name.toLowerCase() === member.name.toLowerCase())) {
         throw new Rejection('discussion-member-name-taken', `a member is already called ${member.name}`)
       }
+      if (agentDescriptor(member.agent).capabilities.readOnly === false) {
+        throw new Rejection('discussion-member-read-only', `${agentDescriptor(member.agent).label} 不支持只读模式，无法加入讨论`)
+      }
       await this.deps.conversations.validateStartOptions(member.agent, { permissionMode: agentDescriptor(member.agent).discussionMode, model: member.model, effort: member.effort })
       if (!this.deps.conversations.capacityAvailable(member.agent)) throw new Rejection('agent-capacity')
       const memberId = randomUUID()
@@ -278,8 +285,8 @@ export class DiscussionService {
         .run(memberId, id, Number(last?.next ?? 0), conversationId, member.agent, member.model ?? null, member.effort ?? null, member.name, member.role)
       try {
         const mode = agentDescriptor(member.agent).discussionMode
-        await this.deps.conversations.create(member.agent, discussion.projectPaths, mode === 'bypass',
-          { permissionMode: mode, model: member.model, effort: member.effort, deferStart: true },
+        await this.deps.conversations.create(member.agent, discussion.projectPaths, false,
+          { permissionMode: mode, model: member.model, effort: member.effort, deferStart: true, readOnly: true },
           null, conversationId, { id, title: `${discussion.title} · ${member.name}` })
       } catch (error) {
         this.db.prepare('DELETE FROM discussion_members WHERE id = ?').run(memberId)
@@ -412,8 +419,6 @@ export class DiscussionService {
     if (request && request.kind === 'approval' && this.pendingOf(member.id)) {
       if (request.tool !== null && PLAN_TOOLS.has(request.tool)) {
         void this.deps.conversations.respond(conversation.id, request.requestId, { decision: 'deny', message: PLAN_DENIAL }).catch(() => {})
-      } else if (agentDescriptor(member.agent).discussionMode === 'bypass') {
-        void this.deps.conversations.respond(conversation.id, request.requestId, { decision: 'allow' }).catch(() => {})
       }
     }
     const status = this.statusOf(member.id, conversation)
@@ -529,14 +534,18 @@ export class DiscussionService {
     for (const each of unseen) deliver.run(JSON.stringify([...each.delivered, member.id]), each.id)
     this.announcePosts(discussion.id, [post])
     try {
-      const mode = agentDescriptor(member.agent).discussionMode
-      const bypass = mode === 'bypass'
-      const conversation = this.deps.conversations.get(member.conversationId)
-      if (conversation.chatOptions?.permissionMode !== mode || (bypass && !conversation.chatOptions?.allowBypass)) {
-        this.db.prepare('UPDATE conversations SET chat_options = ? WHERE id = ?')
-          .run(JSON.stringify({ ...conversation.chatOptions, permissionMode: mode, ...(bypass ? { allowBypass: true } : {}) }), member.conversationId)
+      if (agentDescriptor(member.agent).capabilities.readOnly === false) {
+        throw new Rejection('discussion-member-read-only', `${agentDescriptor(member.agent).label} 不支持只读模式，无法继续讨论`)
       }
-      if (!conversation.chat) await this.deps.conversations.continue(member.conversationId, bypass)
+      const mode = agentDescriptor(member.agent).discussionMode
+      const conversation = this.deps.conversations.get(member.conversationId)
+      if (conversation.chatOptions?.permissionMode !== mode || conversation.chatOptions?.allowBypass) {
+        const { allowBypass: _bypass, ...rest } = conversation.chatOptions ?? {}
+        const cleaned = { ...rest, permissionMode: mode }
+        this.db.prepare('UPDATE conversations SET chat_options = ? WHERE id = ?')
+          .run(JSON.stringify(cleaned), member.conversationId)
+      }
+      if (!conversation.chat) await this.deps.conversations.continue(member.conversationId, false)
       await this.deps.conversations.send(member.conversationId, text, [], true, false, `${REF_PREFIX}${post.id}`)
     } catch (error) {
       this.settle(post.id, member.conversationId, failure(error))
