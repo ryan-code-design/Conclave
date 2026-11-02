@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto'
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { ConversationService, type ConversationEvent } from './conversation-service'
 import { ConversationStore } from './conversation-store'
 import { AttachmentStore } from './attachment-store'
@@ -78,6 +78,37 @@ describe('ConversationService', () => {
     store.close()
     tasks.close()
     rmSync(root, { recursive: true, force: true })
+  })
+
+  it.each(['antigravity', 'gemini'] as const)('refuses unsupported read-only %s starts before persisting or spawning', async (agent) => {
+    await expect(service.create(agent, [], true, { readOnly: true, deferStart: true }))
+      .rejects.toMatchObject({ reason: 'read-only-unsupported' })
+    await expect(service.create(agent, [], true, { deferStart: true }, null, undefined, { id: 'discussion-1', title: 'Read' }))
+      .rejects.toMatchObject({ reason: 'discussion-member-read-only' })
+    await expect(service.startForTask({ id: 'task-1', title: 'Read', agent }, {
+      cwd: root, extraDirs: [], planOnly: false, workspaceReadOnly: true, session: 'new', allowBypass: true
+    })).rejects.toMatchObject({ reason: 'read-only-unsupported' })
+    expect(service.listAll()).toEqual([])
+    expect(daemon.spawns).toEqual([])
+  })
+
+  it('refuses to resume a legacy unsupported read-only conversation', async () => {
+    const legacy = store.create('antigravity', root, [root], randomUUID())
+    store.setWorkspaceReadOnly(legacy.id, true)
+    store.setChatOptions(legacy.id, { permissionMode: 'bypass', allowBypass: true })
+    await expect(service.continue(legacy.id, true)).rejects.toMatchObject({ reason: 'read-only-unsupported' })
+    expect(daemon.spawns).toEqual([])
+    expect(service.stages(legacy.id)).toEqual([])
+  })
+
+  it('refuses a read-only handoff before stopping the current agent', async () => {
+    const current = await service.create('claude', [], true, { readOnly: true })
+    expect(store.chatOptions(current.id).allowBypass).toBe(false)
+    await expect(service.handoff(current.id, 'antigravity', '', true, true))
+      .rejects.toMatchObject({ reason: 'read-only-unsupported' })
+    expect(service.get(current.id).sessionId).toBe(current.sessionId)
+    expect(daemon.spawns).toHaveLength(1)
+    expect(daemon.killed).toEqual([])
   })
 
   it('reads live settings for a fresh conversation without starting or changing the source', async () => {
@@ -969,6 +1000,11 @@ describe('ConversationService', () => {
   })
 
   it('takes options for next start on imported or deferred conversations without stage state, using catalog', async () => {
+    // The models a CLI lists are the agent's own and change with it, so they stand in for the
+    // catalog here: with no stage to read them from, core would otherwise ask the installed Codex.
+    vi.spyOn(service, 'chatCatalog').mockResolvedValue({
+      models: [{ id: 'gpt-6-sol', label: 'GPT-6-Sol', description: null, efforts: ['low', 'high'], isDefault: true }]
+    })
     const imported = await service.create('codex', [], undefined, { deferStart: true })
     service.importStage(imported.id, 'codex', 'ext-session-1', { entries: [], messages: [] })
     await service.setOption(imported.id, 'model', 'gpt-6-sol')
